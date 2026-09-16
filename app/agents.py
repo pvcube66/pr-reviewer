@@ -1,4 +1,4 @@
-"""4 specialists + aggregator on Groq. Sequential + backoff = free-tier safe."""
+"""4 specialists + aggregator on Groq. Sequential execution with backoff."""
 from __future__ import annotations
 import asyncio
 import json
@@ -35,7 +35,7 @@ SYS = (
     "Use exact file paths and hunk line numbers from the diff. Empty array [] if truly clean. "
     "Max 8 findings, highest severity first."
 )
-# ponytail: role text lives in prompts/<PROMPT_VERSION>/*.md; contract stays in code
+# role text lives in prompts/<version>/; output contract stays here
 
 async def _call(prompt: str, retries: int = 3, *, label: str = "llm") -> str:
     import time
@@ -56,7 +56,7 @@ async def _call(prompt: str, retries: int = 3, *, label: str = "llm") -> str:
         except Exception as e:
             emit("llm.call", label=label, ok=False, error=str(e)[:200], attempt=attempt)
             _fails += 1
-            if _fails >= 5:  # ponytail: 5 straight fails -> 60s open circuit
+            if _fails >= 5:
                 _open_until = time.time() + 60
                 _fails = 0
                 emit("llm.circuit_open", label=label)
@@ -88,7 +88,7 @@ async def run_specialist(role: str, diff: str, context: str = "") -> list[Findin
     if stripped:
         emit("security.injection_stripped", role=role, lines=stripped)
     prompt = f"{load_prompt(role)}\n{SYS}\n\n<context>{context[:4000]}</context>\n<diff>{diff[:12000]}</diff>"
-    # ponytail: 12k-char cap keeps each call ~4k tokens, under the 8k TPM free-tier ceiling
+    # 12k chars ≈ 4k tokens per call, inside the TPM ceiling
     return _parse(await _call(prompt, label=f"specialist.{role}"))
 
 async def run_aggregator(all_findings: list[Finding]) -> str:

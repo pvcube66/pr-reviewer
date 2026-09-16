@@ -6,7 +6,7 @@ from langgraph.graph import StateGraph, END
 from .agents import Finding, run_specialist, run_aggregator
 from .memory import retrieve
 
-_gate = asyncio.Semaphore(1)  # Groq free tier: 30 RPM -> force serial
+_gate = asyncio.Semaphore(1)  # serial execution stays inside the RPM limit
 
 class State(TypedDict):
     diff: str
@@ -57,7 +57,6 @@ async def review_pr(diff: str, repo: str = "default") -> str:
     return res["markdown"]
 
 def demo():
-    # ponytail: runnable self-check, no framework
     import json
     f = Finding(severity="major", file="a.py", line=1, issue="x", rationale="y", confidence=0.9)
     assert json.loads(f.model_dump_json())["severity"] == "major"

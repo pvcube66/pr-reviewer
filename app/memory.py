@@ -11,7 +11,6 @@ def get_client(path: str = "./.chroma"):
     return _client
 
 def chunk(text: str, size: int = 2000, overlap: int = 200) -> list[str]:
-    # ponytail: char-split, not token-split; good enough for diffs
     out, i = [], 0
     while i < len(text):
         out.append(text[i : i + size])

@@ -19,7 +19,7 @@ async def fetch_diff(repo: str, pr: int) -> str:
 async def post_comment(repo: str, pr: int, body: str) -> bool:
     tok = os.getenv("GITHUB_TOKEN", "")
     if not tok:
-        print(body)  # ponytail: stdout fallback when no token
+        print(body)
         return False
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.post(

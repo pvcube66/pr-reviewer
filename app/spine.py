@@ -1,4 +1,4 @@
-"""Local JSONL event spine. Tiger-compatible schema, zero infra.
+"""Local JSONL event spine. Tiger-compatible schema.
 Each line: {ts, type, repo, pr, ...}. Swap writer for Tiger insert later.
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ def emit(type: str, **fields) -> dict:
         with open(SPINE_PATH, "a") as f:
             f.write(json.dumps(evt) + "\n")
     except OSError:
-        pass  # ponytail: observability never breaks the review path
+        pass
     return evt
 
 def demo():

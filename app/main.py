@@ -12,7 +12,7 @@ from .github import fetch_diff, post_comment
 from .spine import emit
 
 app = FastAPI(title="pr-reviewer")
-_seen: dict[str, float] = {}  # ponytail: bounded dedupe; Redis only if multi-replica
+_seen: dict[str, float] = {}
 
 def _mark_seen(delivery: str) -> bool:
     """True if duplicate. Evicts oldest past 10k entries."""
