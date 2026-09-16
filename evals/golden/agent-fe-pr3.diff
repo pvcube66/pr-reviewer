@@ -1,0 +1,793 @@
+diff --git a/agent-fe/src/app/dashboard/campaignmanagement/page.tsx b/agent-fe/src/app/dashboard/campaignmanagement/page.tsx
+index 3af73a1..13cb111 100644
+--- a/agent-fe/src/app/dashboard/campaignmanagement/page.tsx
++++ b/agent-fe/src/app/dashboard/campaignmanagement/page.tsx
+@@ -53,7 +53,7 @@ export default function CampaignManagementPage() {
+     : [];
+ 
+   return (
+-    <div className="mx-auto max-w-[860px]">
++    <div className="w-full">
+       <div className="flex flex-wrap items-center justify-between gap-3">
+         <div>
+           <h1 className="op-display text-[24px]">All Campaigns</h1>
+diff --git a/agent-fe/src/app/dashboard/campaigns/[id]/page.tsx b/agent-fe/src/app/dashboard/campaigns/[id]/page.tsx
+new file mode 100644
+index 0000000..62c93ad
+--- /dev/null
++++ b/agent-fe/src/app/dashboard/campaigns/[id]/page.tsx
+@@ -0,0 +1,615 @@
++"use client";
++
++import { useEffect, useMemo, useState } from "react";
++import { useParams, useRouter } from "next/navigation";
++import { ArrowLeft, Headphones, Pause, Play, RefreshCw, Search, Square } from "lucide-react";
++import axiosInstance from "@/lib/axios";
++import { BatchSession, BatchSummary, useBatchManagement } from "@/hooks/useBatchManagement";
++import type ApiCallRecord from "@/types/ApiCallRecord";
++import { DataTable, Pagination } from "@/components/outpero/ui/DataTable";
++import Pill from "@/components/outpero/ui/Pill";
++import { getSentiment, SENTIMENT_STYLE } from "@/lib/sentiment";
++import { fmtINR } from "@/lib/timeFormatter";
++import ConversationDrawer from "@/components/outpero/conversations/ConversationDrawer";
++import { audioUrl, fmtClock } from "@/lib/callInsights";
++import dayjs from "dayjs";
++import utc from "dayjs/plugin/utc";
++import timezone from "dayjs/plugin/timezone";
++
++dayjs.extend(utc);
++dayjs.extend(timezone);
++
++
++
++function fmtTime(iso?: string | null) {
++  if (!iso) return "—";
++  const d = new Date(iso);
++  return `${d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })} ${d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}`;
++}
++
++function formatDuration(seconds: number): string {
++  if (seconds === 0) return "0s";
++  const mins = Math.floor(seconds / 60);
++  const secs = seconds % 60;
++  if (mins === 0) return `${secs}s`;
++  return `${mins}m ${secs}s`;
++}
++
++export default function BatchDetailsPage() {
++  const params = useParams();
++  const router = useRouter();
++  const id = String(params.id || "");
++
++  const {
++    getBatchSessionById,
++    getBatchSummary,
++    pauseBatchCall,
++    resumeBatchCall,
++    stopBatchCall,
++    retryBatchCall,
++  } = useBatchManagement();
++
++  const [session, setSession] = useState<BatchSession | null>(null);
++  const [summary, setSummary] = useState<BatchSummary | null>(null);
++  const [calls, setCalls] = useState<ApiCallRecord[]>([]);
++  const [loading, setLoading] = useState(true);
++  const [actionLoading, setActionLoading] = useState(false);
++  const [selectedCall, setSelectedCall] = useState<ApiCallRecord | null>(null);
++
++  // Filters for calls
++  const [query, setQuery] = useState("");
++  const [outcomeFilter, setOutcomeFilter] = useState("All outcomes");
++  const [recordingFilter, setRecordingFilter] = useState<"all" | "with" | "without">("all");
++  const [page, setPage] = useState(1);
++  const [rowsPerPage, setRowsPerPage] = useState(10);
++
++  const loadData = async () => {
++    if (!id) return;
++    setLoading(true);
++    try {
++      const [sessionData, summaryData] = await Promise.all([
++        getBatchSessionById(id),
++        getBatchSummary(id),
++      ]);
++
++      if (sessionData) {
++        setSession(sessionData);
++      }
++      if (summaryData) {
++        setSummary(summaryData);
++      }
++
++      // Fetch calls associated with this batch campaign
++      const campaignName = sessionData?.campaignName || summaryData?.campaignName || "";
++      const queryParams = new URLSearchParams({
++        limit: "500",
++        page: "1",
++      });
++      if (campaignName && campaignName !== "Not Assigned") {
++        queryParams.set("campaign", campaignName);
++      }
++
++      const res = await axiosInstance.get(`/call-logs/specific-date/?${queryParams.toString()}`);
++      const rawCalls: ApiCallRecord[] = Array.isArray(res.data?.data) ? res.data.data : [];
++
++      // Filter calls belonging to this batch run
++      const batchPhones = new Set((sessionData?.phoneNumbers || []).map((p: string) => p.trim().replace(/\s+/g, "")));
++      const batchCreatedAt = sessionData?.createdAt ? new Date(sessionData.createdAt).getTime() : 0;
++
++      // 1. First check if any calls have batch_session_id or batch_id stamped
++      const idMatched = rawCalls.filter((c) => {
++        const item = c as unknown as Record<string, unknown>;
++        return item["batch_session_id"] === sessionData?._id || item["batch_id"] === sessionData?._id;
++      });
++
++      if (idMatched.length > 0) {
++        setCalls(idMatched);
++      } else if (batchPhones.size > 0) {
++        // 2. Filter calls to phone numbers in this batch executed around/after the batch was created
++        const phoneMatched = rawCalls.filter((c) => {
++          const cleanedPhone = (c.phone_number || "").trim().replace(/\s+/g, "");
++          const isTargetPhone = batchPhones.has(cleanedPhone) || Array.from(batchPhones).some((bp) => cleanedPhone.endsWith(bp) || bp.endsWith(cleanedPhone));
++          if (!isTargetPhone) return false;
++
++          if (batchCreatedAt && c.created_at) {
++            const callTime = new Date(c.created_at).getTime();
++            // Call must be within 24 hours after batch creation (allowing 10m leeway before)
++            return callTime >= batchCreatedAt - 10 * 60 * 1000 && callTime <= batchCreatedAt + 24 * 60 * 60 * 1000;
++          }
++          return true;
++        });
++        setCalls(phoneMatched);
++      } else {
++        setCalls(rawCalls);
++      }
++    } catch {
++      // ignore
++    } finally {
++      setLoading(false);
++    }
++  };
++
++  useEffect(() => {
++    loadData();
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [id]);
++
++  const handleAction = async (action: "pause" | "resume" | "stop" | "retry") => {
++    if (!session) return;
++    setActionLoading(true);
++    try {
++      if (action === "pause") await pauseBatchCall(session._id);
++      else if (action === "resume") await resumeBatchCall(session._id);
++      else if (action === "stop") await stopBatchCall(session._id);
++      else if (action === "retry") await retryBatchCall(session._id);
++      await loadData();
++    } finally {
++      setActionLoading(false);
++    }
++  };
++
++  // Filter calls
++  const filteredCalls = useMemo(() => {
++    const q = query.trim().toLowerCase();
++    return calls.filter((c) => {
++      if (q && ![c.phone_number, c.agentDisplayName, c.agent_name, c.call_summary].some((v) => (v || "").toLowerCase().includes(q))) {
++        return false;
++      }
++      if (outcomeFilter !== "All outcomes" && (c.call_outcome || "").toLowerCase() !== outcomeFilter.toLowerCase()) {
++        return false;
++      }
++      const hasRec = !!audioUrl(c);
++      if (recordingFilter === "with" && !hasRec) return false;
++      if (recordingFilter === "without" && hasRec) return false;
++      return true;
++    });
++  }, [calls, query, outcomeFilter, recordingFilter]);
++
++  // Dynamic stats computed directly from calls displayed for 100% consistency with cards
++  const metrics = useMemo(() => {
++    const total = calls.length;
++    const answered = calls.filter((c) => c.answered || c.call_status === "answered" || c.call_outcome === "Answered").length;
++    const missed = calls.filter((c) => ["busy", "no_answer", "no_response", "missed"].includes((c.call_status || "").toLowerCase()) || (c.call_outcome || "").toLowerCase() === "missed").length;
++    const failed = calls.filter((c) => (c.call_status || "").toLowerCase() === "failed" || (c.call_outcome || "").toLowerCase() === "failed").length;
++    const successRate = total > 0 ? Math.round((answered / total) * 100) : 0;
++    const totalDuration = calls.reduce((acc, c) => acc + (c.call_duration_seconds || 0), 0);
++    const avgDuration = total > 0 ? Math.round(totalDuration / total) : 0;
++
++    return {
++      total: total || (summary?.totalCalls ?? session?.totalContacts ?? 0),
++      answered: total > 0 ? answered : (summary?.answeredCalls ?? 0),
++      missed: total > 0 ? missed : (summary?.missedCalls ?? 0),
++      failed: total > 0 ? failed : (summary?.failedCalls ?? 0),
++      successRate: total > 0 ? successRate : (summary?.successRate ?? 0),
++      avgDuration: total > 0 ? avgDuration : (summary?.averageCallDurationSeconds ?? 0),
++    };
++  }, [calls, summary, session]);
++
++  const totalPages = Math.ceil(filteredCalls.length / rowsPerPage) || 1;
++
++  const paginatedCalls = useMemo(() => {
++    const start = (page - 1) * rowsPerPage;
++    return filteredCalls.slice(start, start + rowsPerPage);
++  }, [filteredCalls, page, rowsPerPage]);
++
++  const status = session?.status || "completed";
++  const canPause = status === "processing" || status === "in_progress" || status === "running";
++  const canResume = status === "paused";
++  const canStop = ["processing", "in_progress", "running", "paused"].includes(status);
++  const canRetry = status === "failed" || status === "stopped" || status === "cancelled";
++
++  return (
++    <div className="w-full space-y-6 pb-12">
++      {/* Top Header */}
++      <div>
++        <button
++          type="button"
++          onClick={() => router.push("/dashboard/campaigns")}
++          className="inline-flex items-center gap-1.5 text-xs font-semibold text-opmuted hover:text-opink transition"
++        >
++          <ArrowLeft size={14} /> Back to Bulk Campaigns
++        </button>
++
++        <div className="mt-3 flex flex-wrap items-center justify-between gap-4">
++          <div>
++            <div className="flex items-center gap-3">
++              <h1 className="op-display text-2xl md:text-3xl">
++                {session?.batchName || summary?.batchName || "Batch Details"}
++              </h1>
++              <span className="rounded-full bg-violet-100 px-3 py-0.5 text-xs font-bold uppercase tracking-wider text-opprimary">
++                {status.replace(/_/g, " ")}
++              </span>
++            </div>
++            <p className="mt-1 text-sm text-opbody">
++              {session?.campaignName && session.campaignName !== "Not Assigned"
++                ? `Campaign: ${session.campaignName}`
++                : "Standalone Batch Run"}{" "}
++              · Created {fmtTime(session?.createdAt)}
++            </p>
++          </div>
++
++          {/* Quick Actions */}
++          <div className="flex items-center gap-2">
++            <button
++              type="button"
++              onClick={loadData}
++              disabled={loading}
++              className="op-btn-ghost !rounded-full !p-2 text-opbody hover:text-opink"
++              title="Refresh"
++            >
++              <RefreshCw size={16} className={loading ? "animate-spin" : ""} />
++            </button>
++
++            {canPause && (
++              <button
++                type="button"
++                disabled={actionLoading}
++                onClick={() => handleAction("pause")}
++                className="op-btn-ghost !rounded-full !px-4 !py-2 !text-xs font-semibold text-amber-600 hover:bg-amber-50"
++              >
++                <Pause size={14} /> Pause
++              </button>
++            )}
++
++            {canResume && (
++              <button
++                type="button"
++                disabled={actionLoading}
++                onClick={() => handleAction("resume")}
++                className="op-btn-primary !rounded-full !px-4 !py-2 !text-xs font-semibold"
++              >
++                <Play size={14} /> Resume
++              </button>
++            )}
++
++            {canStop && (
++              <button
++                type="button"
++                disabled={actionLoading}
++                onClick={() => handleAction("stop")}
++                className="op-btn-ghost !rounded-full !px-4 !py-2 !text-xs font-semibold text-rose-600 hover:bg-rose-50"
++              >
++                <Square size={14} /> Stop
++              </button>
++            )}
++
++            {canRetry && (
++              <button
++                type="button"
++                disabled={actionLoading}
++                onClick={() => handleAction("retry")}
++                className="op-btn-primary !rounded-full !px-4 !py-2 !text-xs font-semibold"
++              >
++                <RefreshCw size={14} /> Retry Batch
++              </button>
++            )}
++          </div>
++        </div>
++      </div>
++
++      {/* Summary KPI Cards Grid */}
++      <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
++        <div className="op-card p-4">
++          <p className="text-xs font-semibold uppercase tracking-wider text-opmuted">Total Contacts</p>
++          <p className="op-display mt-2 text-2xl text-opink">
++            {metrics.total}
++          </p>
++          <p className="mt-1 text-[11px] text-opmuted">In this batch run</p>
++        </div>
++
++        <div className="op-card p-4">
++          <p className="text-xs font-semibold uppercase tracking-wider text-green-600">Answered</p>
++          <p className="op-display mt-2 text-2xl text-green-600">
++            {metrics.answered}
++          </p>
++          <p className="mt-1 text-[11px] text-opmuted">Connected calls</p>
++        </div>
++
++        <div className="op-card p-4">
++          <p className="text-xs font-semibold uppercase tracking-wider text-amber-600">Missed / Busy</p>
++          <p className="op-display mt-2 text-2xl text-amber-600">
++            {metrics.missed}
++          </p>
++          <p className="mt-1 text-[11px] text-opmuted">Unanswered attempts</p>
++        </div>
++
++        <div className="op-card p-4">
++          <p className="text-xs font-semibold uppercase tracking-wider text-rose-600">Failed</p>
++          <p className="op-display mt-2 text-2xl text-rose-600">
++            {metrics.failed}
++          </p>
++          <p className="mt-1 text-[11px] text-opmuted">Network / dial errors</p>
++        </div>
++
++        <div className="op-card p-4">
++          <p className="text-xs font-semibold uppercase tracking-wider text-opprimary">Success Rate</p>
++          <p className="op-display mt-2 text-2xl text-opprimary">
++            {metrics.successRate}%
++          </p>
++          <p className="mt-1 text-[11px] text-opmuted">Pickup percentage</p>
++        </div>
++
++        <div className="op-card p-4">
++          <p className="text-xs font-semibold uppercase tracking-wider text-blue-600">Avg Duration</p>
++          <p className="op-display mt-2 text-2xl text-blue-600">
++            {formatDuration(metrics.avgDuration)}
++          </p>
++          <p className="mt-1 text-[11px] text-opmuted">Per call duration</p>
++        </div>
++      </div>
++
++      {/* Audit Score & Run Metadata Banner */}
++      <div className="grid gap-4 lg:grid-cols-3">
++        <div className="op-card flex items-center justify-between p-5 lg:col-span-2">
++          <div className="space-y-1">
++            <p className="text-xs font-bold uppercase tracking-wider text-opmuted">Batch Progress & Details</p>
++            <p className="text-sm font-semibold text-opink">
++              Employee Assigned:{" "}
++              <span className="text-opprimary font-bold">
++                {session?.agentId?.flow_id || (calls[0]?.agentDisplayName || calls[0]?.agent_name || "—")}
++              </span>
++            </p>
++            <p className="text-xs text-opmuted">
++              Scheduled:{" "}
++              {session?.scheduledDateTime
++                ? dayjs(session.scheduledDateTime).tz("Asia/Kolkata").format("DD/MM/YYYY, hh:mm A")
++                : "Immediate execution"}
++            </p>
++          </div>
++          <div className="text-right">
++            <div className="text-2xl font-bold text-opprimary">
++              {Math.min(
++                100,
++                Math.max(
++                  0,
++                  session?.progressPercent ??
++                    (session?.totalContacts
++                      ? Math.round(
++                          ((session.contactsCompleted ?? session.contactsProcessed ?? 0) /
++                            session.totalContacts) *
++                            100
++                        )
++                      : calls.length > 0 ? 100 : 0)
++                )
++              )}
++              %
++            </div>
++            <p className="text-xs text-opmuted">
++              {session?.contactsCompleted ?? calls.length} / {session?.totalContacts ?? calls.length} completed
++            </p>
++          </div>
++        </div>
++
++        {summary?.averageAuditScore != null ? (
++          <div className="op-card flex flex-col justify-between p-5">
++            <div>
++              <p className="text-xs font-bold uppercase tracking-wider text-teal-600">Quality / Audit Score</p>
++              <div className="mt-2 flex items-baseline gap-2">
++                <span className="op-display text-3xl font-bold text-teal-900">
++                  {summary.averageAuditScore.toFixed(2)}
++                </span>
++                <span className="text-xs text-opmuted">/ 10.0</span>
++              </div>
++            </div>
++            <div className="mt-3 w-full bg-teal-100 rounded-full h-2">
++              <div
++                className="bg-teal-600 h-2 rounded-full transition-all"
++                style={{ width: `${Math.min(100, (summary.averageAuditScore / 10) * 100)}%` }}
++              />
++            </div>
++          </div>
++        ) : (
++          <div className="op-card flex flex-col justify-center p-5">
++            <p className="text-xs font-bold uppercase tracking-wider text-opmuted">Quality & Audit</p>
++            <p className="mt-1 text-sm text-opbody">
++              {calls.length > 0 ? "Calls analyzed by Swara AI auditor" : "Awaiting call completions"}
++            </p>
++          </div>
++        )}
++      </div>
++
++      {/* Calls Section with Table & Audio */}
++      <div className="op-card p-5">
++        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-opborder pb-4">
++          <div>
++            <h2 className="text-base font-bold text-opink">Call Recordings & Transcripts</h2>
++            <p className="text-xs text-opmuted">
++              Click any call to listen to the audio recording, read the turn-by-turn transcript, and review extracted answers.
++            </p>
++          </div>
++
++          <div className="flex flex-wrap items-center gap-2">
++            <div className="flex items-center gap-2 rounded-full border border-opborder bg-white px-3 py-1.5 shadow-sm">
++              <Search size={14} className="text-opmuted" />
++              <input
++                value={query}
++                onChange={(e) => {
++                  setQuery(e.target.value);
++                  setPage(1);
++                }}
++                placeholder="Search phone, employee, summary..."
++                className="w-48 bg-transparent text-xs text-opink outline-none placeholder:text-opmuted"
++              />
++            </div>
++
++            <select
++              value={outcomeFilter}
++              onChange={(e) => {
++                setOutcomeFilter(e.target.value);
++                setPage(1);
++              }}
++              className="op-input !py-1.5 !text-xs !w-auto"
++            >
++              <option>All outcomes</option>
++              <option>Qualified</option>
++              <option>Interested</option>
++              <option>Callback</option>
++              <option>Not interested</option>
++              <option>No answer</option>
++              <option>Busy</option>
++              <option>Call failed</option>
++            </select>
++
++            <select
++              value={recordingFilter}
++              onChange={(e) => {
++                setRecordingFilter(e.target.value as "all" | "with" | "without");
++                setPage(1);
++              }}
++              className="op-input !py-1.5 !text-xs !w-auto"
++            >
++              <option value="all">All calls</option>
++              <option value="with">With recording</option>
++              <option value="without">Without recording</option>
++            </select>
++          </div>
++        </div>
++
++        {/* Calls Table */}
++        <div className="mt-4">
++          <DataTable>
++            <thead>
++              <tr className="border-b border-opborder bg-opcanvas/50">
++                <th className="px-4 py-3 text-left text-xs font-bold uppercase text-opmuted">Contact</th>
++                <th className="px-4 py-3 text-left text-xs font-bold uppercase text-opmuted">Outcome</th>
++                <th className="px-4 py-3 text-left text-xs font-bold uppercase text-opmuted">Sentiment</th>
++                <th className="px-4 py-3 text-left text-xs font-bold uppercase text-opmuted">Recording</th>
++                <th className="px-4 py-3 text-left text-xs font-bold uppercase text-opmuted">Duration</th>
++                <th className="px-4 py-3 text-left text-xs font-bold uppercase text-opmuted">Cost</th>
++                <th className="px-4 py-3 text-left text-xs font-bold uppercase text-opmuted">Date / Time</th>
++                <th className="px-4 py-3 text-left text-xs font-bold uppercase text-opmuted">Summary</th>
++              </tr>
++            </thead>
++            <tbody>
++              {loading && calls.length === 0 ? (
++                <tr>
++                  <td colSpan={8} className="px-4 py-12 text-center text-sm text-opmuted">
++                    <div className="flex items-center justify-center gap-2">
++                      <RefreshCw size={16} className="animate-spin text-opprimary" />
++                      Loading calls...
++                    </div>
++                  </td>
++                </tr>
++              ) : paginatedCalls.length === 0 ? (
++                <tr>
++                  <td colSpan={8} className="px-4 py-12 text-center text-sm text-opmuted">
++                    No calls match the selected filters.
++                  </td>
++                </tr>
++              ) : (
++                paginatedCalls.map((c) => {
++                  const url = audioUrl(c);
++                  const sent = getSentiment(c);
++                  const outcome = c.call_outcome || (c.answered ? "Answered" : c.call_status || "Completed");
++
++                  return (
++                    <tr
++                      key={c._id}
++                      onClick={() => setSelectedCall(c)}
++                      className="cursor-pointer border-b border-opborder transition hover:bg-opcanvas/60"
++                    >
++                      <td className="px-4 py-3 text-sm font-semibold text-opink">
++                        <div className="flex items-center gap-2">
++                          <span>{c.phone_number}</span>
++                          {c.customer_name && (
++                            <span className="text-xs font-normal text-opmuted">({c.customer_name})</span>
++                          )}
++                        </div>
++                      </td>
++
++                      <td className="px-4 py-3">
++                        <Pill
++                          tone={
++                            outcome.toLowerCase().includes("qualif")
++                              ? "green"
++                              : outcome.toLowerCase().includes("callback") || outcome.toLowerCase().includes("interest")
++                              ? "primary"
++                              : outcome.toLowerCase().includes("fail")
++                              ? "red"
++                              : "neutral"
++                          }
++                        >
++                          {outcome}
++                        </Pill>
++                      </td>
++
++                      <td className="px-4 py-3 text-xs">
++                        {sent ? (
++                          <span
++                            className={`inline-block rounded-full px-2 py-0.5 font-medium ${
++                              SENTIMENT_STYLE[sent as keyof typeof SENTIMENT_STYLE] || "bg-gray-100 text-gray-700"
++                            }`}
++                          >
++                            {sent}
++                          </span>
++                        ) : (
++                          <span className="text-opmuted">—</span>
++                        )}
++                      </td>
++
++                      <td className="px-4 py-3">
++                        {url ? (
++                          <span className="inline-flex items-center gap-1 text-xs font-semibold text-opprimary">
++                            <Headphones size={13} /> Recording
++                          </span>
++                        ) : (
++                          <span className="text-xs text-opmuted">No audio</span>
++                        )}
++                      </td>
++
++                      <td className="px-4 py-3 text-xs text-opbody">
++                        {fmtClock(c.call_duration_seconds)}
++                      </td>
++
++                      <td className="px-4 py-3 text-xs text-opbody">
++                        {c.cost_inr != null ? fmtINR(c.cost_inr) : "—"}
++                      </td>
++
++                      <td className="px-4 py-3 text-xs text-opmuted whitespace-nowrap">
++                        {fmtTime(c.created_at)}
++                      </td>
++
++                      <td className="max-w-[280px] px-4 py-3 text-[13px] text-opbody">
++                        <p className="truncate" title={c.call_summary || ""}>
++                          {c.call_summary || "No summary available."}
++                        </p>
++                      </td>
++                    </tr>
++                  );
++                })
++              )}
++            </tbody>
++          </DataTable>
++
++          <div className="mt-4">
++            <Pagination
++              showing={
++                filteredCalls.length > 0
++                  ? `Showing ${(page - 1) * rowsPerPage + 1}–${Math.min(page * rowsPerPage, filteredCalls.length)} of ${filteredCalls.length} calls`
++                  : "0 calls"
++              }
++              page={page}
++              totalPages={totalPages}
++              rowsPerPage={rowsPerPage}
++              onRowsPerPage={(n) => {
++                setRowsPerPage(n);
++                setPage(1);
++              }}
++              onPrev={() => setPage((p) => Math.max(1, p - 1))}
++              onNext={() => setPage((p) => Math.min(totalPages, p + 1))}
++            />
++          </div>
++        </div>
++      </div>
++
++      {/* Conversation Detail Drawer */}
++      {selectedCall && (
++        <ConversationDrawer
++          call={selectedCall}
++          onClose={() => setSelectedCall(null)}
++          onChanged={loadData}
++        />
++      )}
++    </div>
++  );
++}
+diff --git a/agent-fe/src/app/dashboard/campaigns/page.tsx b/agent-fe/src/app/dashboard/campaigns/page.tsx
+index 807816e..b8efd74 100644
+--- a/agent-fe/src/app/dashboard/campaigns/page.tsx
++++ b/agent-fe/src/app/dashboard/campaigns/page.tsx
+@@ -324,7 +324,7 @@ export default function CampaignsPage() {
+   }
+ 
+   return (
+-    <div className="mx-auto max-w-[760px]">
++    <div className="w-full">
+       <button type="button" onClick={() => setView("intro")} className="flex items-center gap-1.5 text-[13px] font-medium text-opbody hover:text-opink">
+         <ArrowLeft size={14} /> All campaigns
+       </button>
+diff --git a/agent-fe/src/app/dashboard/employees/new/page.tsx b/agent-fe/src/app/dashboard/employees/new/page.tsx
+index 35a7353..27f9a8e 100644
+--- a/agent-fe/src/app/dashboard/employees/new/page.tsx
++++ b/agent-fe/src/app/dashboard/employees/new/page.tsx
+@@ -223,7 +223,7 @@ function NewEmployeeInner() {
+   };
+ 
+   return (
+-    <div className="mx-auto max-w-[880px]">
++    <div className="w-full">
+       <p className="op-eyebrow-purple">Hire an employee</p>
+       <h1 className="op-display mt-1 text-[30px]">Tell us how the call should go.</h1>
+       <p className="mt-2 text-sm text-opbody">
+diff --git a/agent-fe/src/app/dashboard/inbound/page.tsx b/agent-fe/src/app/dashboard/inbound/page.tsx
+index 6ce7d10..18305d0 100644
+--- a/agent-fe/src/app/dashboard/inbound/page.tsx
++++ b/agent-fe/src/app/dashboard/inbound/page.tsx
+@@ -46,7 +46,7 @@ function InboundInner() {
+       fn((p) => ({ ...p, [k]: e.target.type === "number" ? Number(e.target.value) : e.target.value }));
+ 
+   return (
+-    <div className="mx-auto max-w-[860px]">
++    <div className="w-full">
+       <p className="op-eyebrow-purple">Calling · Inbound</p>
+       <h1 className="op-display mt-1 text-[30px]">Inbound Calls</h1>
+       <p className="mt-1.5 text-sm text-opbody">
+diff --git a/agent-fe/src/app/dashboard/knowledgebase/page.tsx b/agent-fe/src/app/dashboard/knowledgebase/page.tsx
+index 6f3e1a7..44bae4a 100644
+--- a/agent-fe/src/app/dashboard/knowledgebase/page.tsx
++++ b/agent-fe/src/app/dashboard/knowledgebase/page.tsx
+@@ -91,7 +91,7 @@ export default function KnowledgeBasePage() {
+   };
+ 
+   return (
+-    <div className="mx-auto max-w-[860px]">
++    <div className="w-full">
+       <div className="flex flex-wrap items-center justify-between gap-3">
+         <div>
+           <h1 className="op-display text-[24px]">Knowledge bases</h1>
+diff --git a/agent-fe/src/app/dashboard/numbers/page.tsx b/agent-fe/src/app/dashboard/numbers/page.tsx
+index 2b16701..f19d621 100644
+--- a/agent-fe/src/app/dashboard/numbers/page.tsx
++++ b/agent-fe/src/app/dashboard/numbers/page.tsx
+@@ -45,7 +45,7 @@ export default function NumbersPage() {
+   );
+ 
+   return (
+-    <div className="mx-auto max-w-[860px]">
++    <div className="w-full">
+       <p className="op-eyebrow-purple">Setup · Numbers</p>
+       <h1 className="op-display mt-1 text-[30px]">Phone Numbers</h1>
+       <p className="mt-1.5 text-sm text-opbody">
+diff --git a/agent-fe/src/app/dashboard/providerconfig/page.tsx b/agent-fe/src/app/dashboard/providerconfig/page.tsx
+index 5daa69a..995d7c5 100644
+--- a/agent-fe/src/app/dashboard/providerconfig/page.tsx
++++ b/agent-fe/src/app/dashboard/providerconfig/page.tsx
+@@ -78,7 +78,7 @@ export default function ProviderConfigPage() {
+   };
+ 
+   return (
+-    <div className="mx-auto max-w-[860px]">
++    <div className="w-full">
+       <div className="flex flex-wrap items-center justify-between gap-3">
+         <div>
+           <h1 className="op-display text-[24px]">Provider keys</h1>
+diff --git a/agent-fe/src/components/BatchSessionsList.tsx b/agent-fe/src/components/BatchSessionsList.tsx
+index 1a1a605..2f037d6 100644
+--- a/agent-fe/src/components/BatchSessionsList.tsx
++++ b/agent-fe/src/components/BatchSessionsList.tsx
+@@ -10,7 +10,8 @@ import Table from '@/components/common/Table/Table';
+ import Button from '@/components/common/Button/Button';
+ import EditScheduledBatchDialog from '@/components/EditScheduledBatchDialog';
+ import BatchSummaryDialog from '@/components/BatchSummaryDialog';
+-import Dialog from '@/components/common/Dialog/Dialog';
++import Dialog from '@/components/common/Dialog/Dialog';
++import { useRouter } from 'next/navigation';
+ 
+ 
+ interface BatchSessionsListProps {
+@@ -24,6 +25,7 @@ const BatchSessionsList: React.FC<BatchSessionsListProps> = ({
+   searchTerm = '', 
+   agentFilter = '' 
+ }) => {
++  const router = useRouter();
+   const {
+     getAllBatchSessions,
+     getActiveBatchSessions,
+@@ -378,7 +380,12 @@ const BatchSessionsList: React.FC<BatchSessionsListProps> = ({
+       <Table
+         data={tableData}
+         isLoading={loading && sessions.length === 0}
+-        renderActions={renderActions}
++        renderActions={renderActions}
++        hiddenColumns={['batch_id']}
++        onRowClick={(row) => {
++          const batchId = (row['batch_id'] as string) || (row['_id'] as string);
++          if (batchId && batchId !== '-') router.push("/dashboard/campaigns/" + batchId);
++        }}
+         enablePagination={pagination.totalPages > 1}
+         onClickNext={() => handlePageChange(pagination.currentPage + 1)}
+         onClickPrevious={() => handlePageChange(pagination.currentPage - 1)}
+diff --git a/agent-fe/src/components/common/Table/Table.tsx b/agent-fe/src/components/common/Table/Table.tsx
+index 1092ba9..537c91e 100644
+--- a/agent-fe/src/components/common/Table/Table.tsx
++++ b/agent-fe/src/components/common/Table/Table.tsx
+@@ -36,10 +36,12 @@ type Props = {
+   showSerialNumber?: boolean;
+   currentPage?: number;
+   minRows?: number;
++  hiddenColumns?: string[];
+ };
+ 
+-const Table = ({ data = [], isLoading = false, renderActions, enablePagination = false, onRowClick, onClickNext, onClickPrevious, totalPages, showSerialNumber = false, currentPage = 1, minRows = 10 }: Props) => {
+-  const headers = data.length > 0 ? Object.keys(data[0]) : [];
++const Table = ({ data = [], isLoading = false, renderActions, enablePagination = false, onRowClick, onClickNext, onClickPrevious, totalPages, showSerialNumber = false, currentPage = 1, minRows = 10, hiddenColumns = [] }: Props) => {
++  const allHeaders = data.length > 0 ? Object.keys(data[0]) : [];
++  const headers = allHeaders.filter((key) => !hiddenColumns.includes(key));
+ 
+   if (isLoading) {
+     return (
+diff --git a/agent-fe/src/components/layouts/DashboardLayout.tsx b/agent-fe/src/components/layouts/DashboardLayout.tsx
+index ed69ddb..abe4ab8 100644
+--- a/agent-fe/src/components/layouts/DashboardLayout.tsx
++++ b/agent-fe/src/components/layouts/DashboardLayout.tsx
+@@ -13,7 +13,7 @@ function DashboardChrome({ children }: { children: React.ReactNode }) {
+       <Sidebar />
+       <div className={`min-h-screen overflow-x-hidden bg-opcanvas transition-[margin-left] duration-300 ease-in-out ${collapsed ? "ml-[72px]" : "ml-[248px]"}`}>
+         <Topbar />
+-        <main className="mx-auto max-w-[1120px] px-6 py-5">
++        <main className="w-full px-6 py-5 md:px-8">
+           <div className="mt-5">{children}</div>
+         </main>
+       </div>
+diff --git a/agent-fe/src/components/outpero/employee/EmployeeBuilderForm.tsx b/agent-fe/src/components/outpero/employee/EmployeeBuilderForm.tsx
+index c1f6202..2685eb7 100644
+--- a/agent-fe/src/components/outpero/employee/EmployeeBuilderForm.tsx
++++ b/agent-fe/src/components/outpero/employee/EmployeeBuilderForm.tsx
+@@ -290,7 +290,7 @@ export default function EmployeeBuilderForm({
+             </Link>
+           </div>
+ 
+-          <div className="mt-3 grid grid-cols-1 gap-2.5 sm:grid-cols-2">
++          <div className="mt-3 grid grid-cols-1 gap-2.5 sm:grid-cols-2 lg:grid-cols-3">
+             {selectedIndustryData.jobs.map((job) => {
+               const active = selectedJob === job.id;
+               return (

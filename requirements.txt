@@ -7,3 +7,4 @@ langchain-core
 chromadb
 httpx
 python-dotenv
+pytest

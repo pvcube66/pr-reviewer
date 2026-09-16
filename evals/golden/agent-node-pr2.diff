@@ -1,0 +1,21 @@
+diff --git a/controllers/batchCallController.js b/controllers/batchCallController.js
+index 116b19a..72e26ac 100644
+--- a/controllers/batchCallController.js
++++ b/controllers/batchCallController.js
+@@ -633,6 +633,16 @@ const stopBatchCall = async (req, res) => {
+             data: response.data
+         });
+     } catch (error) {
++        // If Python doesn't have it active in-memory (e.g. server restarted or already finished), update DB directly
++        if (error.response?.status === 404) {
++            await BatchCall.updateOne({ _id: req.body?.batchSessionId, owner: req.user._id }, {
++                $set: { status: 'stopped', stoppedAt: new Date(), errorMessage: 'Stopped by user' }
++            });
++            return res.status(200).json({
++                success: true,
++                message: "Batch was not actively running in memory; marked as stopped in database."
++            });
++        }
+         console.error('Error stopping batch call:', error.response?.data || error.message);
+         return res.status(error.response?.status || 500).json({
+             success: false,
