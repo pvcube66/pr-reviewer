@@ -7,8 +7,12 @@ import os
 from langchain_groq import ChatGroq
 from pydantic import BaseModel, Field
 
+from .prompts import load as load_prompt
+
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 _llm = None
+_fails = 0
+_open_until = 0.0
 
 def get_llm():
     global _llm
@@ -24,32 +28,6 @@ class Finding(BaseModel):
     rationale: str = ""
     confidence: float = 0.5
 
-PROMPTS = {
-    "security": (
-        "You are a senior AppSec reviewer. Inspect this PR diff for REAL, exploitable issues: "
-        "injection (SQL/NoSQL/command/LDAP/XSS), broken authN/authZ incl. missing owner/tenant scoping on DB writes, "
-        "IDOR, SSRF, open redirects, hardcoded secrets, weak crypto, mass assignment, prototype pollution, "
-        "insecure direct object refs from req.body/query without validation, overly broad error messages leaking internals. "
-        "Rate each finding critical/major/minor. Ignore purely stylistic points."
-    ),
-    "quality": (
-        "You are a staff engineer reviewing for correctness and maintainability. Flag: unhandled promise rejections / "
-        "missing await, race conditions, null/undefined derefs (esp. optional chaining gaps), wrong HTTP status codes, "
-        "silent swallowing of errors, N+1 queries, unbounded loops/pagination, dead code, duplicated logic, "
-        "magic strings/numbers, functions over ~50 lines, misleading names. "
-        "Rate major for likely runtime bugs, minor for maintainability."
-    ),
-    "tests": (
-        "You are a QA-focused reviewer. The diff may add product code without tests. Flag: new branches with zero test "
-        "coverage, missing edge cases (404/empty/expired/unauthorized paths), untested error fallbacks, flaky patterns "
-        "(time-based, random, external calls without mocks), assertions that can't fail. Suggest the concrete test to add."
-    ),
-    "docs": (
-        "You are a docs reviewer. Flag ONLY user-facing gaps: exported components/functions with no doc comment, "
-        "changed API contracts without updated types/docs, stale comments contradicting new code, cryptic UX copy. "
-        "Do NOT flag internal trivial code — prefer fewer, higher-value findings."
-    ),
-}
 SYS = (
     "Return ONLY a JSON array, no prose. Each item: "
     '{"severity":"critical|major|minor|info","file":"path/from/diff","line":123,'
@@ -57,15 +35,32 @@ SYS = (
     "Use exact file paths and hunk line numbers from the diff. Empty array [] if truly clean. "
     "Max 8 findings, highest severity first."
 )
+# ponytail: role text lives in prompts/<PROMPT_VERSION>/*.md; contract stays in code
 
-async def _call(prompt: str, retries: int = 3) -> str:
+async def _call(prompt: str, retries: int = 3, *, label: str = "llm") -> str:
+    import time
+    from .spine import emit
+    global _fails, _open_until
+    if time.time() < _open_until:
+        raise RuntimeError("groq circuit open, try later")
     delay = 4
     for attempt in range(retries + 1):
         try:
             await asyncio.sleep(2)  # stagger to stay under 30 RPM
-            return (await get_llm().ainvoke(prompt)).content
+            t0 = time.time()
+            out = (await get_llm().ainvoke(prompt)).content
+            emit("llm.call", label=label, ms=int((time.time() - t0) * 1000),
+                 prompt_chars=len(prompt), ok=True)
+            _fails = 0
+            return out
         except Exception as e:
-            if "429" not in str(e) and "rate" not in str(e).lower():
+            emit("llm.call", label=label, ok=False, error=str(e)[:200], attempt=attempt)
+            _fails += 1
+            if _fails >= 5:  # ponytail: 5 straight fails -> 60s open circuit
+                _open_until = time.time() + 60
+                _fails = 0
+                emit("llm.circuit_open", label=label)
+            if "429" not in str(e) and "rate" not in str(e).lower() and "413" not in str(e):
                 raise
             if attempt == retries:
                 raise
@@ -87,15 +82,16 @@ def _parse(text: str) -> list[Finding]:
     return out
 
 async def run_specialist(role: str, diff: str, context: str = "") -> list[Finding]:
-    prompt = f"{PROMPTS[role]}\n{SYS}\n\n<context>{context[:4000]}</context>\n<diff>{diff[:12000]}</diff>"
+    from .security import guard_diff
+    from .spine import emit
+    diff, stripped = guard_diff(diff)
+    if stripped:
+        emit("security.injection_stripped", role=role, lines=stripped)
+    prompt = f"{load_prompt(role)}\n{SYS}\n\n<context>{context[:4000]}</context>\n<diff>{diff[:12000]}</diff>"
     # ponytail: 12k-char cap keeps each call ~4k tokens, under the 8k TPM free-tier ceiling
-    return _parse(await _call(prompt))
+    return _parse(await _call(prompt, label=f"specialist.{role}"))
 
 async def run_aggregator(all_findings: list[Finding]) -> str:
     raw = "\n".join(f.model_dump_json() for f in all_findings)[:12000] or "No findings."
-    prompt = (
-        "Deduplicate these PR findings, drop confidence<0.4, sort critical first. "
-        "Return clean Markdown: ## Summary + bullet per finding (severity, file:line, issue, fix).\n\n"
-        f"{raw}"
-    )
-    return await _call(prompt)
+    prompt = f"{load_prompt('aggregator')}\n\n{raw}"
+    return await _call(prompt, label="aggregator")
